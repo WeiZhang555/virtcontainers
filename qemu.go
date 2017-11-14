@@ -21,9 +21,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	ciaoQemu "github.com/01org/ciao/qemu"
 	"github.com/containers/virtcontainers/pkg/uuid"
@@ -41,6 +41,7 @@ type qmpChannel struct {
 // QemuState keeps Qemu's state
 type QemuState struct {
 	Bridges []Bridge
+	UUID    string
 }
 
 // qemu is an Hypervisor interface implementation for the Linux qemu hypervisor.
@@ -470,25 +471,6 @@ func (q *qemu) appendImage(devices []ciaoQemu.Device, podConfig PodConfig) ([]ci
 	return devices, nil
 }
 
-func (q *qemu) forceUUIDFormat(str string) string {
-	re := regexp.MustCompile(`[^[0-9,a-f,A-F]]*`)
-	hexStr := re.ReplaceAllLiteralString(str, ``)
-
-	slice := []byte(hexStr)
-	sliceLen := len(slice)
-
-	var uuidSlice uuid.UUID
-	uuidLen := len(uuidSlice)
-
-	if sliceLen > uuidLen {
-		copy(uuidSlice[:], slice[:uuidLen])
-	} else {
-		copy(uuidSlice[:], slice)
-	}
-
-	return uuidSlice.String()
-}
-
 func (q *qemu) getMachine(name string) (ciaoQemu.Machine, error) {
 	for _, m := range supportedQemuMachines {
 		if m.Type == name {
@@ -542,16 +524,19 @@ func (q *qemu) init(pod *Pod) error {
 	q.config = pod.config.HypervisorConfig
 	q.pod = pod
 
-	if err = pod.storage.fetchHypervisorState(pod.id, &q.state); err != nil {
+	if err := pod.storage.fetchHypervisorState(pod.id, &q.state); err != nil {
 		q.Logger().Debug("Creating bridges")
 		q.state.Bridges = NewBridges(q.config.DefaultBridges, q.config.HypervisorMachineType)
+
+		q.Logger().Debug("Creating UUID")
+		q.state.UUID = uuid.Generate().String()
 	}
 
-	if err = q.buildPath(); err != nil {
+	if err := q.buildPath(); err != nil {
 		return err
 	}
 
-	if err = q.buildKernelParams(q.config); err != nil {
+	if err := q.buildKernelParams(q.config); err != nil {
 		return err
 	}
 
@@ -670,12 +655,12 @@ func (q *qemu) createPod(podConfig PodConfig) error {
 
 	q.qmpMonitorCh = qmpChannel{
 		ctx:  context.Background(),
-		path: fmt.Sprintf("%s/%s/%s", runStoragePath, podConfig.ID, monitorSocket),
+		path: fmt.Sprintf("%s/%s/%s-%s", runStoragePath, podConfig.ID, q.state.UUID, monitorSocket),
 	}
 
 	q.qmpControlCh = qmpChannel{
 		ctx:  context.Background(),
-		path: fmt.Sprintf("%s/%s/%s", runStoragePath, podConfig.ID, controlSocket),
+		path: fmt.Sprintf("%s/%s/%s-%s", runStoragePath, podConfig.ID, q.state.UUID, controlSocket),
 	}
 
 	qmpSockets := []ciaoQemu.QMPSocket{
@@ -717,7 +702,7 @@ func (q *qemu) createPod(podConfig PodConfig) error {
 
 	qemuConfig := ciaoQemu.Config{
 		Name:        fmt.Sprintf("pod-%s", podConfig.ID),
-		UUID:        q.forceUUIDFormat(podConfig.ID),
+		UUID:        q.state.UUID,
 		Path:        q.path,
 		Ctx:         q.qmpMonitorCh.ctx,
 		Machine:     machine,
@@ -736,7 +721,7 @@ func (q *qemu) createPod(podConfig PodConfig) error {
 
 	q.qemuConfig = qemuConfig
 
-	return nil
+	return q.pod.storage.storeHypervisorState(podConfig.ID, q.state)
 }
 
 // startPod will start the Pod's VM.
